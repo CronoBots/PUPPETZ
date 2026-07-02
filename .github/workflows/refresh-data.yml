@@ -11,12 +11,7 @@ name: Refresh leaderboard data
 on:
   schedule:
     - cron: '0 6 * * *'   # tous les jours à 06:00 UTC (s'exécute quand le runner est en ligne)
-  workflow_dispatch:       # bouton « Run workflow » manuel
-    inputs:
-      skip_twitter:
-        description: "Ne pas récupérer les liens X/Twitter (moins de requêtes, plus sûr si l'IP est limitée)"
-        type: boolean
-        default: false
+  workflow_dispatch: {}    # bouton « Run workflow » manuel
 
 permissions:
   contents: write
@@ -59,11 +54,6 @@ jobs:
       - name: Build data.json
         run: node Test.js
         env:
-          # Mode doux : concurrence 1 + backoff/pauses rallongés → débit de requêtes bas,
-          # évite les 429/1015 de crypto.com (surtout si l'IP est en pénalité Cloudflare).
-          GENTLE: '1'
-          # Skip des liens X/Twitter (gros multiplicateur de requêtes) si demandé au lancement manuel.
-          SKIP_TWITTER: ${{ inputs.skip_twitter }}
           # Clé API Explorer Cronos (mints V3 fiables pour le Sales Bot). Optionnelle :
           # sans elle, Test.js retombe sur la lecture on-chain via RPC.
           CRONOS_EXPLORER_API_KEY: ${{ secrets.CRONOS_EXPLORER_API_KEY }}
