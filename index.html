@@ -2582,6 +2582,7 @@ body::after {
       <a href="#home" data-nav="home"><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18" stroke-linecap="round"/><path d="M12 3c2.6 2.7 2.6 15.3 0 18M12 3c-2.6 2.7-2.6 15.3 0 18" stroke-linecap="round"/></svg><span class="nav-txt">Univers</span></a>
       <a href="#collections" data-nav="collections"><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="3.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="13" y="3.5" width="7" height="7" rx="1.5"/><rect x="3.5" y="13" width="7" height="7" rx="1.5"/><rect x="13" y="13" width="7" height="7" rx="1.5"/></svg><span class="nav-txt">Collections</span></a>
       <a href="#leaderboard" data-nav="leaderboard"><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M6 20V11M12 20V4M18 20v-6"/></svg><span class="nav-txt">Leaderboard</span></a>
+      <a href="#pool" data-nav="pool"><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l2.6 5.3 5.9.85-4.25 4.15 1 5.85L12 16.9l-5.25 2.75 1-5.85L3.5 9.15l5.9-.85z"/></svg><span class="nav-txt">Puppetz Pool</span></a>
     </div>
   </nav>
 
@@ -2938,7 +2939,7 @@ body::after {
 
     // Navigation par ONGLETS : une seule vue affichée à la fois (Home / Collections /
     // Leaderboard / Artist / Sales Bot). Plus de page unique scrollable.
-    const VIEWS = ['home', 'collections', 'leaderboard', 'artist', 'salesbot'];
+    const VIEWS = ['home', 'collections', 'leaderboard', 'pool'];
     function syncNav(name) {
       document.querySelectorAll('.nav-links a[data-nav]').forEach(a => {
         const on = a.dataset.nav === name;
@@ -3787,6 +3788,120 @@ body::after {
       selectBoard(0); // état initial : Global
     }
 
+    // ─────────────────────────────────────────────────────────────────────────────
+    // PUPPETZ POOL — classement par points : 2 pts / NFT Puppetz possédé, mais
+    // 15 pts / NFT si la collection est une Genesis (Genesis Collection ou Genesis
+    // Peasants). Calculé côté client depuis collectionsData (owners par collection).
+    // ─────────────────────────────────────────────────────────────────────────────
+    const POOL_GENESIS_TITLES = ['Puppetz - Genesis Collection', 'Puppetz - Genesis Peasants'];
+    const POOL_PTS_GENESIS = 15;
+    const POOL_PTS_NORMAL = 2;
+    let POOL_RANKING = [];   // [{ name, points, nfts, url, twitter }]
+
+    // Agrège les points par holder à travers toutes les collections.
+    function computePoolRanking(collections) {
+      const byName = {};
+      (collections || []).forEach(col => {
+        const ppn = POOL_GENESIS_TITLES.includes(col.title) ? POOL_PTS_GENESIS : POOL_PTS_NORMAL;
+        (col.owners || []).forEach(o => {
+          if (!o || !o.name) return;
+          const e = byName[o.name] || (byName[o.name] = { name: o.name, points: 0, nfts: 0, url: o.url || ('https://crypto.com/nft/profile/' + o.name), twitter: o.twitter || '' });
+          e.points += (o.count || 0) * ppn;
+          e.nfts += (o.count || 0);
+          if (!e.twitter && o.twitter) e.twitter = o.twitter;
+        });
+      });
+      return Object.values(byName).sort((a, b) => b.points - a.points || b.nfts - a.nfts);
+    }
+
+    // <li> du POOL (points + repli au-delà de LB_VISIBLE), même structure que le leaderboard.
+    function poolRowsHTML(entries) {
+      let rank = 1, prev = null;
+      return (entries || []).map((e, i) => {
+        if (i > 0 && e.points < prev) rank += 1;
+        prev = e.points;
+        const rankClass = rank === 1 ? 'rank-1' : rank === 2 ? 'rank-2' : rank === 3 ? 'rank-3' : '';
+        const extra = i >= LB_VISIBLE ? ' lb-extra' : '';
+        const tw = e.twitter ? `<a href="${validateTwitterUrl(e.twitter)}" target="_blank" rel="noopener noreferrer" class="twitter-link" aria-label="${escHtml(getTwitterHandle(e.twitter))} on X" title="${escHtml(getTwitterHandle(e.twitter))}"><svg viewBox="0 0 24 24" aria-hidden="true" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.66l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg></a>` : '';
+        return `<li class="${rankClass}${extra}"><div class="left-container"><span class="rank">${rank}</span><a href="${validateUrl(e.url)}" target="_blank" rel="noopener noreferrer">${escHtml(e.name)}</a>${tw}</div><span class="count-container"><span class="count-number">${e.points.toLocaleString('fr-FR')}</span><span class="count-text">POINTS</span></span></li>`;
+      }).join('');
+    }
+
+    function renderPool() {
+      const section = document.createElement('section');
+      section.className = 'leaderboard-section section reveal hidden-view';
+      section.id = 'pool';
+      section.dataset.view = 'pool';
+      section.innerHTML = `
+        <div class="section-head">
+          <span class="eyebrow">Points Ranking</span>
+          <h2 class="section-title">Puppetz Pool</h2>
+          <p class="section-sub"><b>2</b> points par Puppetz possédé · <b>15</b> points si c'est un Puppetz Genesis.</p>
+        </div>
+        <div class="summary">
+          <input type="text" id="poolSearchInput" placeholder="SEARCH HOLDER" aria-label="Search holders">
+          <ul id="pool-owners"></ul>
+          <span class="show-more-btn" id="pool-show-more" aria-expanded="false" aria-label="Toggle additional holders">SHOW MORE</span>
+        </div>
+      `;
+      return section;
+    }
+
+    // Câble recherche + SHOW MORE du POOL (même logique que wireLeaderboardControls, ids dédiés).
+    function wirePoolControls() {
+      const listEl = document.getElementById('pool-owners');
+      const showMoreBtn = document.getElementById('pool-show-more');
+      const searchInput = document.getElementById('poolSearchInput');
+      if (!listEl) return;
+      listEl.innerHTML = poolRowsHTML(POOL_RANKING);
+      let expanded = false;
+      const applyCollapse = () => {
+        const extras = listEl.querySelectorAll('li.lb-extra');
+        extras.forEach(li => { li.style.display = expanded ? '' : 'none'; });
+        if (showMoreBtn) {
+          showMoreBtn.style.display = extras.length ? '' : 'none';
+          showMoreBtn.textContent = expanded ? 'SHOW LESS' : 'SHOW MORE';
+          showMoreBtn.setAttribute('aria-expanded', String(expanded));
+        }
+      };
+      if (showMoreBtn) {
+        showMoreBtn.setAttribute('role', 'button');
+        showMoreBtn.setAttribute('tabindex', '0');
+        const toggle = () => { expanded = !expanded; applyCollapse(); };
+        showMoreBtn.addEventListener('click', toggle);
+        showMoreBtn.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+      }
+      if (searchInput) {
+        searchInput.addEventListener('input', debounce(() => {
+          const filter = searchInput.value.toLowerCase().trim();
+          const existing = listEl.querySelector('#pool-no-results');
+          if (!filter) {
+            if (existing) existing.remove();
+            listEl.querySelectorAll('li').forEach(li => { li.style.display = ''; });
+            expanded = false; applyCollapse(); return;
+          }
+          expanded = true;
+          let found = false;
+          listEl.querySelectorAll('li:not(#pool-no-results)').forEach(li => {
+            const match = li.textContent.toLowerCase().includes(filter);
+            li.style.display = match ? '' : 'none';
+            if (match) found = true;
+          });
+          if (showMoreBtn) showMoreBtn.style.display = 'none';
+          if (!found) {
+            if (!existing) {
+              const msg = document.createElement('li');
+              msg.id = 'pool-no-results';
+              msg.textContent = 'No results found';
+              msg.style.color = '#fff';
+              listEl.appendChild(msg);
+            }
+          } else if (existing) { existing.remove(); }
+        }, 250));
+      }
+      applyCollapse();
+    }
+
     // Stats marché LIVE côté client (sans attendre le workflow) : crypto.com autorise le CORS
     // depuis cronobots.github.io/PUPPETZ sur son GraphQL. Requête LÉGÈRE (1 appel/collection) → volume,
     // floor, ventes, supply à chaque visite. Le gros snapshot des holders (liste) et le V3
@@ -3926,6 +4041,13 @@ body::after {
       // quand l'onglet Leaderboard est actif (il reste hidden-view sinon).
       const lbSection = document.getElementById('leaderboard');
       if (lbSection) { lbSection.classList.add('in-view'); lbSection.querySelectorAll('.reveal').forEach(r => r.classList.add('in-view')); }
+
+      // PUPPETZ POOL — classement par points (2/NFT, 15/NFT Genesis), calculé depuis collectionsData.
+      POOL_RANKING = computePoolRanking(collectionsData);
+      main.appendChild(renderPool());
+      wirePoolControls();
+      const poolSection = document.getElementById('pool');
+      if (poolSection) { poolSection.classList.add('in-view'); poolSection.querySelectorAll('.reveal').forEach(r => r.classList.add('in-view')); }
 
       // Bandeau de statistiques (compteurs animés)
       buildStatsBand();
