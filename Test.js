@@ -1,0 +1,1024 @@
+// Récupération des propriétaires alignée EXACTEMENT sur le panel « Snapshot » v3.9.8
+// d'index.html. Owner resolution via :
+//   Phase B  — assets(collectionId) paginé (pages en parallèle)
+//   Phase C  — eventHistory(naturesIn:['transferred']) : owner courant par ÉDITION
+//   Phase C-fallback — editions(assetId:) BATCHÉES en aliasing (1 HTTP = N requêtes)
+//                      → ~10× moins de requêtes = plus de 429
+//   Secondary — editionEvents(editionId) pour les NFT retirés (withdrawn)
+//   Phase E  — agrégation : 1 count / édition, holder keyé par uuid||username
+// Plus de limiteur de débit global : on s'appuie sur la concurrence bornée +
+// retry/backoff, comme le fait le snapshot dans le navigateur (IP résidentielle).
+const axios = require('axios');
+const fs = require('fs');
+
+// Liste des identifiants de collections avec option process, usePagination, noms et images.
+// Collections PUPPETZ de l'artiste Sergi Tugas (crypto.com/nft/profile/sergitugas).
+const collections = [
+  { id: '1d891fe3adb4547d02f1482365669780', name: 'Puppetz - Genesis Collection', process: true, usePagination: false, image: 'https://media.nft.crypto.com/09221afe-5953-4843-8b53-884a79cf25df/original.gif' },
+  { id: '05162bd5649f21f6b5fd90467948bdda', name: 'Puppetz - Genesis Peasants', process: true, usePagination: false, image: 'https://media.nft.crypto.com/85fd4c49-cc4c-4ab5-a40c-3d4fc623e203/original.gif' },
+  { id: '90661b775a42a5b69bfd92017ddda2e2', name: 'Puppetz - Peasants 1.0 Collection', process: true, usePagination: true, image: 'https://media.nft.crypto.com/9e77a2ea-a6e5-4112-8a88-18f2f3fa53b7/original.gif' },
+  { id: '516a28d92230e957c6f66922981a2667', name: 'Puppetz - Peasants 2.0 Collection', process: true, usePagination: true, image: 'https://media.nft.crypto.com/554050e5-f832-42a8-91cb-d5a38743c1d2/original.gif' },
+  { id: 'd198dd180d329002418f53961bd9e7ac', name: 'Puppetz - Burgeois Collection', process: true, usePagination: true, image: 'https://media.nft.crypto.com/a339d052-7ea9-4043-adda-302b0dc9df9c/original.gif' },
+  { id: '34c92064bff6bbb386a9b16d8f5a0ceb', name: 'Puppetz - Burgeois 2.0 Collection', process: true, usePagination: true, image: 'https://media.nft.crypto.com/27139a67-df65-4252-a2ff-e77c8dd8b3ff/original.gif' },
+  { id: 'e22eeb3430b7db501f13e6590cf6ca78', name: 'Puppetz - Customs', process: true, usePagination: false, image: 'https://media.nft.crypto.com/c79c92bf-767b-44af-8981-7a6400801f2b/original.gif' },
+  { id: 'd0b780f0f7b31d3c53876083ac188e5d', name: 'Puppetz - Specials', process: true, usePagination: false, image: 'https://media.nft.crypto.com/fe51e22a-30b8-44bd-a216-03db929aca96/original.gif' },
+];
+
+// Générer les URLs des collections à traiter (uniquement celles avec process: true).
+// SNAP_ONLY=<id> (ou nom partiel) permet de ne traiter qu'une collection (debug/test).
+const _only = (process.env.SNAP_ONLY || '').trim().toLowerCase();
+const collectionUrls = collections
+  .filter(collection => collection.process)
+  .filter(collection => !_only || collection.id.toLowerCase().includes(_only) || collection.name.toLowerCase().includes(_only))
+  .map(collection => ({
+    url: `https://crypto.com/nft/collection/${collection.id}`,
+    usePagination: collection.usePagination
+  }));
+
+// Fonction de délai personnalisée
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// Fonction pour nettoyer le nom de la collection pour les IDs HTML
+function cleanFileName(name) {
+  return name.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+}
+
+// Fonction pour assigner les rangs (gold, silver, bronze) aux trois premiers propriétaires
+function assignRanks(owners) {
+  const sortedOwners = [...owners].sort((a, b) => b[1] - a[1]);
+  let currentRank = 1;
+  let previousCount = null;
+  return sortedOwners.map(([name, count], index) => {
+    if (index > 0 && count < previousCount) {
+      currentRank += 1;
+    }
+    previousCount = count;
+    let rank = null;
+    let rankClass = '';
+    if (currentRank === 1) {
+      rank = 'gold';
+      rankClass = 'rank-1';
+    } else if (currentRank === 2) {
+      rank = 'silver';
+      rankClass = 'rank-2';
+    } else if (currentRank === 3) {
+      rank = 'bronze';
+      rankClass = 'rank-3';
+    }
+    return { name, url: `https://crypto.com/nft/profile/${name}`, count, rank, rankClass };
+  });
+}
+
+// Fonction pour charger Owners.json
+function loadOwnersJson() {
+  try {
+    if (fs.existsSync('Owners.json')) {
+      const data = fs.readFileSync('Owners.json', 'utf8');
+      return JSON.parse(data);
+    }
+    return {};
+  } catch (error) {
+    console.error('Error loading Owners.json:', error.message);
+    return {};
+  }
+}
+
+// Fonction pour sauvegarder Owners.json
+function saveOwnersJson(ownersData) {
+  try {
+    fs.writeFileSync('Owners.json', JSON.stringify(ownersData, null, 2), 'utf8');
+  } catch (error) {
+    console.error('Error saving Owners.json:', error.message);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GraphQL — endpoint + config (alignés sur le panel Snapshot v3.9.8 d'index.html)
+// ─────────────────────────────────────────────────────────────────────────────
+const GQL_ENDPOINT = 'https://crypto.com/nft-api/graphql';
+
+const HTTP_HEADERS = {
+  'Content-Type': 'application/json',
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
+};
+
+// Tunables — calqués sur SNAP_CONF (v3.9.8). Le modèle de coût de l'API plafonne
+// à 250/requête, ~17 par alias → 10 alias × first=1 ≈ 170 (sûr), 5 × first=100 ≈ 135.
+const SNAP_CONF = {
+  ASSET_PAGE_SIZE:                 100,  // assets() page size (max API)
+  ASSET_PAGE_CONCURRENCY:            3,  // pages assets() en parallèle
+  HISTORY_PAGE_SIZE:               100,  // eventHistory page size (séquentiel)
+  HISTORY_MAX_CONSECUTIVE_FAILS:     5,  // abandon après N échecs d'affilée
+  RETRY_BASE_MS:                   500,  // backoff exponentiel de base
+  RETRY_MAX_ATTEMPTS:                7,  // 0.5,1,2,4,8,16,30s (anti-429 résilient)
+  RETRY_MAX_MS:                  30000,  // plafond du backoff
+  PHASE_B_EMPTY_WAVE_LIMIT:          3,  // stop pagination spéculative après N vagues vides
+  FALLBACK_BATCH_SIZE_SINGLE:       10,  // alias/HTTP pour single-edition (first=1)
+  FALLBACK_BATCH_SIZE_MULTI:         5,  // alias/HTTP pour multi-edition  (first=100)
+  FALLBACK_BATCH_CONCURRENCY:        2,  // batches de fallback en parallèle
+  FALLBACK_INTER_BATCH_DELAY_MS:    50,  // petit délai entre batches
+  SECONDARY_FALLBACK_CAP:           50,  // max assets retentés via editionEvents
+};
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// Exécute `worker` sur chaque item avec au plus `limit` tâches simultanées.
+// Conserve l'ordre des résultats (results[i] correspond à items[i]).
+async function mapPool(items, limit, worker) {
+  const results = new Array(items.length);
+  let next = 0;
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true) {
+      const idx = next++;
+      if (idx >= items.length) break;
+      results[idx] = await worker(items[idx], idx);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
+// Découpe un tableau en morceaux de n
+function chunk(arr, n) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+  return out;
+}
+
+// ── Queries (copiées du module Snapshot v3.9.8) ──────────────────────────────
+const Q_COLLECTION_INFO = `query GetCollection($collectionId:ID!,$cacheId:ID){
+  public(cacheId:$cacheId){collection(id:$collectionId){
+    id name verified
+    metrics{ items }
+  }}}`;
+
+const Q_COLLECTION_METRIC = `query GetCollectionMetric($collectionId:ID!,$cacheId:ID){
+  public(cacheId:$cacheId){collectionMetric(id:$collectionId){
+    totalSupply totalSalesCount owners totalSalesDecimal minSaleListingPriceDecimal
+  }}}`;
+
+const Q_ALL_ASSETS = `query GetCollectionAssets($collectionId:ID,$first:Int!,$skip:Int!,$cacheId:ID){
+  public(cacheId:$cacheId){assets(collectionId:$collectionId,first:$first,skip:$skip){
+    id name copies copiesInCirculation
+    offerableEditionId
+    defaultListingV2{ editionId }
+    latestPurchasedEdition{ id }
+  }}}`;
+
+const Q_HISTORY = `query getCollectionEventHistory($collectionId:ID!,$first:Int!,$after:String,$naturesIn:[String!],$cacheId:ID){
+  public(cacheId:$cacheId){collection(id:$collectionId){id eventHistory(first:$first,after:$after,naturesIn:$naturesIn){
+    edges{node{nature createdAt
+      asset{id}
+      edition{index}
+      toUser{uuid username displayName verified isCreator}
+      user{uuid username displayName verified isCreator}
+    }}
+    pageInfo{endCursor hasNextPage}
+  }}}}`;
+
+const Q_EDITION_EVENTS = `query EditionEvents($editionId:ID!,$cacheId:ID){
+  public(cacheId:$cacheId){editionEvents(editionId:$editionId){
+    nature createdAt
+    toUser{uuid username displayName verified isCreator}
+    user{uuid username displayName verified isCreator}
+  }}}`;
+
+// Seul 'transferred' est accepté comme filtre naturesIn par l'API (vérifié
+// empiriquement). Chaque acquisition produit un event 'transferred' → couvre
+// tous les changements de propriétaire. Les mints jamais transférés sont
+// récupérés par le fallback editions(assetId:).
+const TRANSFER_NATURES = ['transferred'];
+
+const profileQuery = `
+    query User($id: ID!, $cacheId: ID) {
+        public(cacheId: $cacheId) {
+            user(id: $id) {
+                username
+                twitterUsername
+            }
+        }
+    }
+`;
+
+// ── Couche réseau ────────────────────────────────────────────────────────────
+const _silentErrorsSeen = new Set();
+
+// POST GraphQL unique avec retry sur erreurs transitoires (réseau / 429 / 403 /
+// 5xx). Les erreurs GraphQL *logiques* (errors && !data) ne sont pas retentées.
+// Les erreurs partielles (errors && data) sont loggées une fois puis on renvoie data.
+async function gql(operationName, variables, query) {
+  let lastErr;
+  for (let attempt = 0; attempt < SNAP_CONF.RETRY_MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await axios.post(GQL_ENDPOINT,
+        { operationName, variables: variables || {}, query },
+        { timeout: 20000, headers: HTTP_HEADERS });
+      const json = res.data;
+      if (json.errors && !json.data) {
+        const e = new Error(json.errors[0]?.message || 'GraphQL error (no data)');
+        e.graphqlLogic = true;
+        throw e;
+      }
+      if (json.errors && json.data && !_silentErrorsSeen.has(operationName)) {
+        _silentErrorsSeen.add(operationName);
+        console.warn(`[gql] ${operationName} partial errors:`, json.errors.slice(0, 3).map(e => e.message).join(' | '));
+      }
+      return json.data;
+    } catch (e) {
+      lastErr = e;
+      if (e.graphqlLogic) throw e; // non-retryable
+      if (attempt < SNAP_CONF.RETRY_MAX_ATTEMPTS - 1) {
+        const backoff = Math.min(SNAP_CONF.RETRY_MAX_MS, SNAP_CONF.RETRY_BASE_MS * Math.pow(2, attempt));
+        await sleep(backoff + Math.floor(Math.random() * 400));
+      }
+    }
+  }
+  throw lastErr;
+}
+
+// editions(assetId:) BATCHÉES via fragments aliasés : 1 HTTP = N requêtes.
+// Amortit le surcoût de coût (~17/alias) → ~10× moins de round-trips = anti-429.
+// Les assetId sont validés en hex avant interpolation (anti-injection).
+const HEX_RE = /^[0-9a-fA-F]+$/;
+async function gqlBatchEditions(assetIds, opts = {}) {
+  const first = opts.first || 1;
+  const skip = Number.isInteger(opts.skip) ? opts.skip : 0;
+  assetIds.forEach(id => {
+    if (typeof id !== 'string' || id.length > 64 || !HEX_RE.test(id)) {
+      throw new Error(`Bad assetId in batch: ${id}`);
+    }
+  });
+  const fragments = assetIds.map((id, i) =>
+`a${i}: public {
+  editions(assetId: "${id}", first: ${first}, skip: ${skip}, isDropLast: false) {
+    totalCount
+    editions {
+      id index
+      owner { uuid username displayName verified isCreator }
+      ownership { primary }
+    }
+  }
+}`).join('\n');
+  const query = `query SnapBatchEditions {\n${fragments}\n}`;
+
+  let lastErr;
+  for (let attempt = 0; attempt < SNAP_CONF.RETRY_MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await axios.post(GQL_ENDPOINT, { operationName: 'SnapBatchEditions', query },
+        { timeout: 20000, headers: HTTP_HEADERS });
+      const json = res.data;
+      if (json.errors && !json.data) throw new Error('GraphQL: ' + (json.errors[0]?.message || 'no data'));
+      if (json.errors && json.errors.length && !_silentErrorsSeen.has('SnapBatchEditions')) {
+        _silentErrorsSeen.add('SnapBatchEditions');
+        console.warn('[gqlBatchEditions] partial errors:', json.errors.slice(0, 3).map(e => e.message).join(' | '));
+      }
+      const out = {};
+      assetIds.forEach((id, i) => { out[id] = json.data?.[`a${i}`]?.editions || null; });
+      return out;
+    } catch (e) {
+      lastErr = e;
+      if (attempt < SNAP_CONF.RETRY_MAX_ATTEMPTS - 1) {
+        const backoff = Math.min(SNAP_CONF.RETRY_MAX_MS, SNAP_CONF.RETRY_BASE_MS * Math.pow(2, attempt));
+        await sleep(backoff + Math.floor(Math.random() * 400));
+      }
+    }
+  }
+  throw lastErr;
+}
+
+// Fonction pour récupérer le twitterUsername via une requête GraphQL directe
+async function getTwitterUsername(username) {
+  let twitterUsername = null;
+  let retries = 3;
+  let delayMs = 1000;
+  while (retries > 0 && !twitterUsername) {
+    try {
+      const response = await axios.post(GQL_ENDPOINT, {
+        query: profileQuery,
+        variables: { id: username, cacheId: `getUserQuery-Profile-${username}` }
+      }, { timeout: 10000, headers: HTTP_HEADERS });
+      const result = response.data;
+      if (result.errors) throw new Error(`GraphQL Error: ${result.errors.map(e => e.message).join(', ')}`);
+      const userData = result.data?.public?.user;
+      if (userData?.twitterUsername) twitterUsername = userData.twitterUsername.replace(/^@/, '');
+      retries = 0;
+    } catch (error) {
+      retries--;
+      if (retries > 0) { await sleep(delayMs); delayMs *= 2; }
+    }
+  }
+  return twitterUsername ? `https://x.com/${twitterUsername}` : '';
+}
+
+// ── Phase C — parcours eventHistory (séquentiel, cursor) ─────────────────────
+// Dérive l'owner courant par ÉDITION (asset.id × edition.index). Events en
+// newest-first → le 1er event vu pour une édition = état courant.
+async function walkOwnersAndDates(collectionId) {
+  const currentOwnerKey = {};      // "assetId|index" → déjà vu ?
+  const realEditionsPerAsset = {}; // assetId → [{ id, index, owner, ownership }]
+  let cursor = null, hasMore = true;
+  let eventCount = 0, pages = 0, pageFailures = 0, consecutiveFailures = 0;
+  const pageErrorMsgs = [];
+
+  while (hasMore) {
+    pages++;
+    let data;
+    try {
+      data = await gql('getCollectionEventHistory',
+        { collectionId, first: SNAP_CONF.HISTORY_PAGE_SIZE, after: cursor || null, naturesIn: TRANSFER_NATURES, cacheId: 'snap-hist-' + collectionId + '-' + (cursor || 'head') },
+        Q_HISTORY);
+      consecutiveFailures = 0;
+    } catch (e) {
+      pageFailures++;
+      consecutiveFailures++;
+      if (pageErrorMsgs.length < 3) pageErrorMsgs.push(e.message);
+      if (consecutiveFailures >= SNAP_CONF.HISTORY_MAX_CONSECUTIVE_FAILS) {
+        throw new Error(`Event history walk aborted: ${consecutiveFailures} consecutive page failures. Last error: ${pageErrorMsgs[0] || 'unknown'}`);
+      }
+      await sleep(500);
+      continue;
+    }
+
+    const hist = data?.public?.collection?.eventHistory;
+    if (!hist) break;
+
+    hist.edges.forEach(({ node }) => {
+      if (!node) return;
+      const aid = node.asset?.id;
+      if (!aid) return;
+      const idx = node.edition?.index ?? 1;
+      const key = `${aid}|${idx}`;
+      const nature = node.nature || 'unknown';
+
+      let owner = null;
+      if (node.toUser?.username) owner = node.toUser;
+      else if (nature === 'withdrawn' && node.user?.username) owner = node.user;
+
+      if (!currentOwnerKey[key] && owner) {
+        currentOwnerKey[key] = true;
+        if (!realEditionsPerAsset[aid]) realEditionsPerAsset[aid] = [];
+        realEditionsPerAsset[aid].push({ id: null, index: idx, owner, ownership: { primary: false } });
+      }
+      eventCount++;
+    });
+
+    cursor = hist.pageInfo.endCursor;
+    hasMore = hist.pageInfo.hasNextPage;
+  }
+
+  return { realEditionsPerAsset, eventCount, pages, pageFailures };
+}
+
+// Construit le classement (collections + leaderboard global) et l'écrit dans data.json.
+// Test.js ne génère plus index.html : l'index charge data.json en direct via fetch().
+// ─────────────────────────────────────────────────────────────────────────────
+// Collection externe V3 (Quantum Cryptonauts V3) — Crovia / Cronos on-chain.
+// Crovia bloque le scraping (Cloudflare) ; on lit donc les détenteurs DIRECTEMENT
+// on-chain via un RPC public Cronos : on parcourt tous les events Transfer du
+// contrat ERC-721 et on calcule le propriétaire actuel de chaque tokenId.
+// → comptes exacts et auto-actualisés à chaque run. Les pseudos (non on-chain)
+// proviennent de la table fixe V3_NAMES ; les autres holders s'affichent en adresse.
+// ─────────────────────────────────────────────────────────────────────────────
+const V3_CONTRACT = '0x840d5e2df597ab3dcfed4e5fc883c8d87606748d';
+const V3_CREATION_BLOCK = 77606321; // bloc de déploiement (fixe) — évite la recherche
+const V3_TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+// RPC publics Cronos qui acceptent eth_getLogs sur des fenêtres de ~2000 blocs (archive).
+// NB (vérifié 2026-06) : publicnode exige désormais un "personal token" pour l'archive et
+// 1rpc.io plafonne getLogs à 50 blocs → tous deux inutilisables ici (faisaient échouer la
+// lecture on-chain V3, d'où le repli permanent sur V3_FALLBACK : mint/holders/ventes figés).
+const CRONOS_RPCS = ['https://evm.cronos.org', 'https://cronos.drpc.org', 'https://rpc.vvs.finance'];
+const RPC_LOG_STEP = 1999; // < limite de 2000 blocs/getLogs des RPC publics
+
+// API Explorer Cronos (Blockscout, compat Etherscan) — clé fournie via secret GitHub
+// CRONOS_EXPLORER_API_KEY. Source fiable et indexée des transferts NFT (mints V3) pour le
+// Sales Bot, en remplacement du scan RPC (plafonné à 2000 blocs). Clé : https://explorer.cronos.com/register
+const CRONOS_EXPLORER_API = 'https://explorer-api.cronos.org/mainnet/api/v1';
+const CRONOS_EXPLORER_KEY = process.env.CRONOS_EXPLORER_API_KEY || '';
+
+// Adresse (minuscule) → pseudo affiché. Les holders absents de cette table
+// s'affichent en adresse tronquée. À compléter quand de nouveaux pseudos sont connus.
+const V3_NAMES = {
+  '0x13550dd892ab9cb22b7a6e48d5eba0d2d181884b': 'SANDIMAN',
+  '0x2b8b37dd17fa67833b01e30229502169d1a8ae40': 'MTCH',
+  '0xac96bdcd69f708a5f660425af5d1248aa27fc1ee': 'JERAAAMY',
+  '0x740cd1001bf468e03a2cef898c4ce880f228da0d': 'CLOUDY',
+  '0x183379144e7c8581f24b02b7eedd4e9995bb1048': 'PAULO24',
+  '0xe6e7284ddc793fdc15c8cdfbde49a2b7e2b234ed': 'WARNEREVERCHANGE',
+  '0x7886acebc8401bd6b1cf397d84b85d01416e4c06': 'PAYSAGISTE00',
+  '0xedce0151656e82150a0835e9b9cbd1ec53a17eae': 'SNAKE APE',
+  '0x64c15f07ea231789bf5d6f9ecc8089caae46b5c2': 'JAMUS0',
+};
+
+// Repli si la lecture on-chain échoue (snapshot du 2026-06-26) → data.json garde un V3 cohérent.
+const V3_FALLBACK = [
+  { addr: '0x13550dd892ab9cb22b7a6e48d5eba0d2d181884b', count: 76 },
+  { addr: '0x2b8b37dd17fa67833b01e30229502169d1a8ae40', count: 55 },
+  { addr: '0x740cd1001bf468e03a2cef898c4ce880f228da0d', count: 49 },
+  { addr: '0xac96bdcd69f708a5f660425af5d1248aa27fc1ee', count: 45 },
+  { addr: '0x183379144e7c8581f24b02b7eedd4e9995bb1048', count: 12 },
+  { addr: '0xe6e7284ddc793fdc15c8cdfbde49a2b7e2b234ed', count: 10 },
+  { addr: '0x7886acebc8401bd6b1cf397d84b85d01416e4c06', count: 6 },
+  { addr: '0xedce0151656e82150a0835e9b9cbd1ec53a17eae', count: 5 },
+  { addr: '0x64c15f07ea231789bf5d6f9ecc8089caae46b5c2', count: 4 },
+  { addr: '0x105f4ed058dc3029c21489f0f1567475e0eeb242', count: 4 },
+  { addr: '0x17bb1d83b312ce76eba5ffd43226b8c98652c1f6', count: 4 },
+  { addr: '0x478ffba8ea4945fb9327812231dfb1c6cafd2c49', count: 3 },
+  { addr: '0x8147d4d7578e661004e25ffd3f9fd7bac1f6fb06', count: 2 },
+  { addr: '0x1d9b981b7aba1a747883833fb8a1b5072eac5d8f', count: 2 },
+  { addr: '0x965a73574acb12b9b48f3ff43415eea791fd70bd', count: 1 },
+  { addr: '0x27ac7493fa8395ad35c260282522b3d9e314cee7', count: 1 },
+  { addr: '0x2270cbad5072b7685357ec83ddc959ffde535b27', count: 1 },
+  { addr: '0xf7e392c06c7691b44a06a0ec1e723bcc0533febf', count: 1 },
+  { addr: '0x8802ebcf0b6bbc97a00fe3495ec0dabf12a0fb2f', count: 1 },
+  { addr: '0xc54c922e7431f5fde646bca35f55adb8ff701ff9', count: 1 },
+];
+
+let _v3RpcIdx = 0;
+async function cronosRpc(method, params) {
+  const MAX_ATTEMPTS = 8;
+  let lastErr;
+  for (let i = 0; i < MAX_ATTEMPTS; i++) {
+    try {
+      const res = await axios.post(CRONOS_RPCS[_v3RpcIdx], { jsonrpc: '2.0', id: 1, method, params },
+        { timeout: 20000, headers: { 'Content-Type': 'application/json' } });
+      if (res.data?.error) throw new Error(res.data.error.message);
+      return res.data?.result;
+    } catch (e) {
+      lastErr = e;
+      _v3RpcIdx = (_v3RpcIdx + 1) % CRONOS_RPCS.length; // RPC suivant
+      // Backoff exponentiel sur 429/503 (les RPC publics limitent le débit), sinon court.
+      const status = e.response?.status;
+      const backoff = (status === 429 || status === 503 || !e.response)
+        ? Math.min(8000, 500 * Math.pow(2, Math.floor(i / CRONOS_RPCS.length)))
+        : 300;
+      await delay(backoff + Math.floor(Math.random() * 250));
+    }
+  }
+  throw lastErr;
+}
+
+// Lit le classement des détenteurs V3 on-chain. Renvoie [{addr,count}] trié desc, ou null si échec.
+async function fetchV3Holders() {
+  try {
+    const latest = parseInt(await cronosRpc('eth_blockNumber', []), 16);
+    const windows = [];
+    for (let from = V3_CREATION_BLOCK; from <= latest; from += RPC_LOG_STEP + 1) {
+      windows.push([from, Math.min(from + RPC_LOG_STEP, latest)]);
+    }
+    console.log(`V3 on-chain : lecture des Transfer sur ${windows.length} fenêtres (blocs ${V3_CREATION_BLOCK}→${latest})…`);
+    const logs = [];
+    await mapPool(windows, 3, async ([from, to]) => {
+      const res = await cronosRpc('eth_getLogs', [{
+        address: V3_CONTRACT, topics: [V3_TRANSFER_TOPIC],
+        fromBlock: '0x' + from.toString(16), toBlock: '0x' + to.toString(16)
+      }]);
+      (res || []).forEach(l => logs.push(l));
+    });
+    // Tri chronologique strict, puis dernier `to` par tokenId = propriétaire actuel.
+    logs.sort((a, b) => (parseInt(a.blockNumber, 16) - parseInt(b.blockNumber, 16)) || (parseInt(a.logIndex, 16) - parseInt(b.logIndex, 16)));
+    const ZERO = '0x0000000000000000000000000000000000000000';
+    const ownerOf = {};
+    const mintsRaw = []; // mints = transferts depuis 0x0 : { t, b, bn }
+    for (const l of logs) {
+      if (!l.topics || l.topics.length !== 4) continue; // ERC-721 (tokenId indexé)
+      const to = '0x' + l.topics[2].slice(26).toLowerCase();
+      const from = '0x' + l.topics[1].slice(26).toLowerCase();
+      const tokenId = BigInt(l.topics[3]).toString();
+      ownerOf[tokenId] = to;
+      if (from === ZERO) mintsRaw.push({ t: Number(tokenId), b: to, bn: parseInt(l.blockNumber, 16) });
+    }
+    const counts = {};
+    for (const t in ownerOf) { const o = ownerOf[t]; if (o === ZERO) continue; counts[o] = (counts[o] || 0) + 1; }
+    const ranking = Object.entries(counts).map(([addr, count]) => ({ addr, count })).sort((a, b) => b.count - a.count);
+    if (ranking.length === 0) throw new Error('0 holder résolu');
+
+    // Date des mints (= ventes V3 dans le Sales Bot) : timestamp du bloc de chaque mint.
+    const uniqBlocks = [...new Set(mintsRaw.map(m => m.bn))];
+    const blockTs = {};
+    await mapPool(uniqBlocks, 3, async (bn) => {
+      try {
+        const blk = await cronosRpc('eth_getBlockByNumber', ['0x' + bn.toString(16), false]);
+        if (blk && blk.timestamp) blockTs[bn] = parseInt(blk.timestamp, 16);
+      } catch (e) { /* bloc ignoré */ }
+    });
+    // Prix de mint forfaitaire (300 CRO) — non disponible dans le log Transfer.
+    const mints = mintsRaw
+      .map(m => ({ t: m.t, b: m.b, cro: 300, ts: blockTs[m.bn] || 0 }))
+      .filter(m => m.ts > 0)
+      .sort((a, b) => b.ts - a.ts)
+      .slice(0, 40);
+
+    console.log(`✅ V3 on-chain : ${ranking.length} détenteurs · ${ranking.reduce((s, r) => s + r.count, 0)} NFT · ${mints.length} mints récents.`);
+    return { ranking, mints };
+  } catch (e) {
+    console.warn(`⚠ Lecture on-chain V3 échouée (${e.message}) → repli sur le snapshot intégré.`);
+    return null;
+  }
+}
+
+// Mints V3 récents via l'API Explorer Cronos (clé). Renvoie [{t,b,cro,ts}] trié du + récent,
+// ou null si pas de clé / échec (→ repli sur les mints lus on-chain par fetchV3Holders).
+async function fetchV3MintsExplorer(limit = 40) {
+  if (!CRONOS_EXPLORER_KEY) { console.log('ℹ Pas de CRONOS_EXPLORER_API_KEY → mints V3 via RPC on-chain.'); return null; }
+  const ZERO = '0x0000000000000000000000000000000000000000';
+  try {
+    const url = `${CRONOS_EXPLORER_API}/account/tokennfttx`;
+    const res = await axios.get(url, {
+      params: { contractaddress: V3_CONTRACT, page: 1, offset: 200, sort: 'desc', apikey: CRONOS_EXPLORER_KEY },
+      timeout: 20000, headers: { 'accept': 'application/json' }
+    });
+    // Réponses possibles : Etherscan-compat {status,message,result:[…]} ou {items:[…]}/{data:[…]}.
+    const d = res.data || {};
+    const rows = Array.isArray(d.result) ? d.result : (Array.isArray(d.items) ? d.items : (Array.isArray(d.data) ? d.data : null));
+    if (!rows) { console.warn('⚠ Explorer API V3 : forme inattendue →', JSON.stringify(d).slice(0, 200)); return null; }
+    const mints = rows
+      .filter(r => String(r.from || r.fromAddress || '').toLowerCase() === ZERO)
+      .map(r => ({
+        t: parseInt(r.tokenID != null ? r.tokenID : (r.tokenId != null ? r.tokenId : r.token_id), 10),
+        b: String(r.to || r.toAddress || '').toLowerCase(),
+        cro: 300,
+        ts: parseInt(r.timeStamp != null ? r.timeStamp : (r.timestamp != null ? r.timestamp : r.time_stamp), 10)
+      }))
+      .filter(m => Number.isFinite(m.t) && m.ts > 0)
+      .sort((a, b) => b.ts - a.ts)
+      .slice(0, limit);
+    console.log(`✅ Explorer API V3 : ${mints.length} mints récents (sur ${rows.length} transferts).`);
+    return mints.length ? mints : null;
+  } catch (e) {
+    console.warn(`⚠ Explorer API V3 échouée (${e.message}) → repli sur les mints RPC on-chain.`);
+    return null;
+  }
+}
+
+// Construit l'objet collection V3 (format data.json) depuis un classement [{addr,count}].
+function buildV3Collection(ranking) {
+  const trunc = a => a.slice(0, 6) + '…' + a.slice(-4);
+  const owners = ranking.map(({ addr, count }) => ({
+    name: V3_NAMES[addr.toLowerCase()] || trunc(addr),
+    count,
+    url: 'https://cronoscan.com/address/' + addr
+  }));
+  // Total minté (= NFT détenus on-chain) : lu en direct → l'index l'affiche dans la barre
+  // « Mint progress » (plus de valeur figée dans index.html). mintTotal = supply max fixe (299).
+  const minted = ranking.reduce((s, r) => s + r.count, 0);
+  return {
+    id: 'collection-v3', title: 'Quantum Cryptonauts V3',
+    image: 'assets/v3-logo.jpg?v=2', banner: 'assets/v3-banner.jpg?v=2',
+    alt: 'Quantum Cryptonauts V3 COLLECTION ICON',
+    ownersCount: owners.length, external: 'crovia', contract: V3_CONTRACT,
+    croviaUrl: 'https://crovia.app/collections/' + V3_CONTRACT,
+    minted, mintTotal: 299,
+    // Crovia n'expose pas de marché secondaire crypto.com → volume/ventes/floor inconnus (0).
+    // supply = NFT mintés on-chain (pour l'agrégat « Items minted » du home).
+    supply: minted, sales: 0, volume: 0, floor: 0,
+    owners
+  };
+}
+
+// Décode une string ABI (retour d'eth_call) : [offset][length][data utf8].
+function decodeAbiString(hex) {
+  if (!hex || hex === '0x') return '';
+  const h = hex.slice(2);
+  const off = parseInt(h.slice(0, 64), 16) * 2;
+  const len = parseInt(h.slice(off, off + 64), 16) * 2;
+  return Buffer.from(h.slice(off + 64, off + 64 + len), 'hex').toString('utf8');
+}
+
+// tokenURI(tokenId) du contrat V3 (ERC-721) via eth_call on-chain → ipfs://FOLDER/N.json.
+async function v3TokenURI(tokenId) {
+  const data = '0xc87b56dd' + BigInt(tokenId).toString(16).padStart(64, '0'); // selector tokenURI(uint256)
+  return decodeAbiString(await cronosRpc('eth_call', [{ to: V3_CONTRACT, data }, 'latest']));
+}
+
+// Métadonnée JSON sur IPFS, avec repli multi-gateway (les passerelles publiques timeout souvent).
+const V3_IPFS_GATEWAYS = ['https://gateway.pinata.cloud', 'https://dweb.link', 'https://ipfs.io', 'https://w3s.link', 'https://nftstorage.link'];
+async function fetchIpfsJson(pathNoScheme) {
+  for (const g of V3_IPFS_GATEWAYS) {
+    try {
+      const r = await axios.get(g + '/ipfs/' + pathNoScheme, { timeout: 15000 });
+      if (r.data) return typeof r.data === 'string' ? JSON.parse(r.data) : r.data;
+    } catch (e) { /* gateway suivante */ }
+  }
+  return null;
+}
+
+// Enrichit chaque mint affiché dans le Sales Bot avec le VRAI NFT minté : nom (n) + image (c, CID IPFS),
+// résolus via tokenURI(id) on-chain → métadonnée IPFS. Best-effort : sans ça, le Sales Bot retombe
+// sur le logo de collection (l'ancienne table EXTERNAL_ASSETS n'était PAS indexable par token id).
+async function enrichV3MintImages(mints) {
+  if (!mints || !mints.length) return;
+  let ok = 0;
+  await mapPool(mints, 4, async (m) => {
+    try {
+      const uri = await v3TokenURI(m.t);
+      if (!uri) return;
+      const meta = await fetchIpfsJson(uri.replace(/^ipfs:\/\//, ''));
+      if (!meta) return;
+      if (meta.name) m.n = meta.name;
+      const img = String(meta.image || '').replace(/^ipfs:\/\//, '').replace(/^.*\/ipfs\//, '');
+      if (img) { m.c = img; ok++; }
+    } catch (e) { /* repli logo */ }
+  });
+  console.log(`✅ Images des mints V3 résolues : ${ok}/${mints.length} (tokenURI → métadonnée IPFS).`);
+}
+
+function writeCryptonautsData(collectionsData, globalOwnerNFTs, ownersData, v3Collection, v3Sales) {
+  // Prepare collectionsData, including all collections from the collections array
+  const allCollectionsData = collections.map(collection => {
+    const scrapedData = collectionsData.find(data => data.collectionId === collection.id) || {
+      collectionName: collection.name,
+      totalSupply: 0,
+      owners: 0,
+      sales: 0,
+      volume: 0,
+      floor: 0,
+      ownerNFTs: {}
+    };
+    return {
+      id: `collection-${collections.indexOf(collection)}`,
+      title: collection.name,
+      image: collection.image,
+      alt: `${collection.name} COLLECTION ICON`,
+      ownersCount: scrapedData.owners,
+      supply: scrapedData.totalSupply || 0,   // items (totalSupply live)
+      sales: scrapedData.sales || 0,          // ventes secondaires (live)
+      volume: scrapedData.volume || 0,        // volume échangé USD (live)
+      floor: scrapedData.floor || 0,          // floor USD (live)
+      // url reconstruite côté client, rank recalculé côté client, twitter omis si vide → JSON plus léger
+      owners: Object.entries(scrapedData.ownerNFTs).map(([name, count]) => {
+        const owner = { name, count };
+        const tw = ownersData[name]?.twitter;
+        if (tw) owner.twitter = tw;
+        return owner;
+      })
+    };
+  });
+
+  // Collection externe (Crovia / Cronos) — ajoutée en tête (la plus récente). Données on-chain,
+  // owners en adresses (cronoscan) ; volontairement absente de globalOwnersData (leaderboard global).
+  // Collection externe V3 (Crovia/Cronos) — en tête si présente. Sur PUPPETZ elle est
+  // absente (v3Collection = null), donc on n'ajoute rien.
+  if (v3Collection) allCollectionsData.unshift(v3Collection);
+
+  // Prepare globalOwnersData (sans url ni rank : reconstruits/recalculés côté client)
+  const globalOwnersData = assignRanks(Object.entries(globalOwnerNFTs)).map(({ name, count }) => {
+    const owner = { name, count };
+    const tw = ownersData[name]?.twitter;
+    if (tw) owner.twitter = tw;
+    return owner;
+  });
+
+  // Écrit le classement dans data.json (consommé par index.html via fetch).
+  // v3Sales = mints V3 récents (on-chain) pour le Sales Bot — remplace l'ancien tableau figé.
+  const out = { generatedAt: new Date().toISOString(), collectionsData: allCollectionsData, globalOwnersData, v3Sales: v3Sales || [] };
+  try {
+    fs.writeFileSync('data.json', JSON.stringify(out), 'utf8');
+    console.log(`✅ data.json écrit : ${allCollectionsData.length} collections · ${globalOwnersData.length} holders globaux.`);
+  } catch (error) {
+    console.error('Erreur écriture data.json :', error.message);
+    throw error;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// processCollection — port fidèle du runSnapshot(collectionId) v3.9.8
+// ─────────────────────────────────────────────────────────────────────────────
+async function processCollection(collectionUrl, usePagination, globalOwnerNFTs, collectionsData, ownersData) {
+  const collectionId = collectionUrl.split('/').pop();
+  let collectionName = '';
+
+  try {
+    // ── PHASE A — Infos collection (nom + métriques officielles) ──────────────
+    let officialItems = 0;
+    let officialOwners = 0;
+    let officialSales = 0;     // ventes secondaires (totalSalesCount)
+    let officialVolume = 0;    // volume échangé USD (totalSalesDecimal)
+    let officialFloor = 0;     // floor USD (minSaleListingPriceDecimal)
+    try {
+      const [info, metric] = await Promise.all([
+        gql('GetCollection', { collectionId, cacheId: 'snap-col-' + collectionId }, Q_COLLECTION_INFO),
+        gql('GetCollectionMetric', { collectionId, cacheId: 'snap-metric-' + collectionId }, Q_COLLECTION_METRIC).catch(() => null)
+      ]);
+      const c = info?.public?.collection;
+      if (c) collectionName = c.name || '';
+      const items = Number(c?.metrics?.items) || 0;
+      const m = metric?.public?.collectionMetric;
+      const totalSupply = Number(m?.totalSupply) || 0;
+      officialItems = Math.max(items, totalSupply);
+      officialOwners = Number(m?.owners) || 0;
+      officialSales = Number(m?.totalSalesCount) || 0;
+      officialVolume = Number(m?.totalSalesDecimal) || 0;
+      officialFloor = Number(m?.minSaleListingPriceDecimal) || 0;
+    } catch (e) {
+      console.warn(`Could not fetch collection info: ${e.message}`);
+    }
+    if (!collectionName) throw new Error(`Failed to retrieve collection name for ${collectionId}`);
+
+    console.log('\nCOLLECTION:');
+    console.log(`- ${collectionName}`);
+    console.log(`- Total Supply (official): ${officialItems}`);
+    console.log(`- Owners (official): ${officialOwners}\n`);
+
+    // ── PHASE B — Tous les assets (pages en parallèle) ────────────────────────
+    const allAssets = [];
+    {
+      console.log('Phase B — Fetching all collection assets…');
+      const hint = officialItems;
+      if (hint > 0) {
+        const pageCount = Math.ceil(hint / SNAP_CONF.ASSET_PAGE_SIZE);
+        const pages = Array.from({ length: pageCount }, (_, i) => i);
+        await mapPool(pages, SNAP_CONF.ASSET_PAGE_CONCURRENCY, async (i) => {
+          const d = await gql('GetCollectionAssets',
+            { collectionId, first: SNAP_CONF.ASSET_PAGE_SIZE, skip: i * SNAP_CONF.ASSET_PAGE_SIZE, cacheId: 'snap-assets-' + collectionId + '-' + i },
+            Q_ALL_ASSETS);
+          (d?.public?.assets || []).forEach(a => allAssets.push(a));
+        });
+        // Sonde de sécurité : s'il manque des assets, on pagine au-delà.
+        let skip = allAssets.length;
+        let safety = 0;
+        while (allAssets.length < hint && safety < 50) {
+          safety++;
+          const d = await gql('GetCollectionAssets',
+            { collectionId, first: SNAP_CONF.ASSET_PAGE_SIZE, skip, cacheId: 'snap-assets-' + collectionId + '-probe' + safety },
+            Q_ALL_ASSETS);
+          const batch = d?.public?.assets || [];
+          if (batch.length === 0) break;
+          batch.forEach(a => allAssets.push(a));
+          skip += batch.length;
+          if (batch.length < SNAP_CONF.ASSET_PAGE_SIZE) break;
+        }
+      } else {
+        // Pas de hint : pagination spéculative par vagues jusqu'à vagues vides.
+        let skip = 0, emptyWaves = 0, ended = false;
+        while (!ended && emptyWaves < SNAP_CONF.PHASE_B_EMPTY_WAVE_LIMIT) {
+          const wave = Array.from({ length: SNAP_CONF.ASSET_PAGE_CONCURRENCY }, (_, k) => skip + k * SNAP_CONF.ASSET_PAGE_SIZE);
+          const before = allAssets.length;
+          await mapPool(wave, SNAP_CONF.ASSET_PAGE_CONCURRENCY, async (s) => {
+            const d = await gql('GetCollectionAssets',
+              { collectionId, first: SNAP_CONF.ASSET_PAGE_SIZE, skip: s, cacheId: 'snap-assets-' + collectionId + '-' + s },
+              Q_ALL_ASSETS);
+            const batch = d?.public?.assets || [];
+            batch.forEach(a => allAssets.push(a));
+            if (batch.length < SNAP_CONF.ASSET_PAGE_SIZE) ended = true;
+          });
+          if (allAssets.length === before) emptyWaves++; else emptyWaves = 0;
+          skip += SNAP_CONF.ASSET_PAGE_CONCURRENCY * SNAP_CONF.ASSET_PAGE_SIZE;
+        }
+      }
+      // Dédup (les pages parallèles peuvent se recouvrir sur la sonde)
+      const seen = new Set();
+      for (let i = allAssets.length - 1; i >= 0; i--) {
+        if (seen.has(allAssets[i].id)) allAssets.splice(i, 1);
+        else seen.add(allAssets[i].id);
+      }
+      const minted = allAssets.reduce((s, a) => s + (a.copiesInCirculation != null ? a.copiesInCirculation : (a.copies || 1)), 0);
+      console.log(`  ✓ Phase B: ${allAssets.length} assets · ${minted} éditions mintées.`);
+    }
+
+    // ── PHASE C — Owner courant par édition via eventHistory ──────────────────
+    console.log('Phase C — Walking event history…');
+    const phaseC = await walkOwnersAndDates(collectionId);
+    const realEditionsPerAsset = phaseC.realEditionsPerAsset;
+    console.log(`  ✓ Phase C: ${phaseC.eventCount} events · ${phaseC.pages} pages · ${Object.keys(realEditionsPerAsset).length} assets résolus${phaseC.pageFailures ? ` · ${phaseC.pageFailures} échecs page` : ''}.`);
+
+    // ── PHASE C-fallback — editions(assetId:) batchées pour les manquants ─────
+    const phantomAssetIds = new Set();
+    {
+      const assetsZero = [], assetsPartial = [];
+      allAssets.forEach(a => {
+        const got = realEditionsPerAsset[a.id]?.length || 0;
+        const minted = a.copiesInCirculation != null ? a.copiesInCirculation : (a.copies || 1);
+        if (minted === 0) return;
+        if (got >= minted) return;
+        if (got > 0) assetsPartial.push(a); else assetsZero.push(a);
+      });
+      const needFallback = [...assetsZero, ...assetsPartial];
+
+      // Fusion par index d'édition (les résultats frais écrasent ceux de Phase C)
+      const mergeEditions = (assetId, fresh) => {
+        const byIndex = new Map();
+        (realEditionsPerAsset[assetId] || []).forEach(ed => { if (ed.index != null) byIndex.set(ed.index, ed); });
+        fresh.forEach(ed => { if (ed.index != null) byIndex.set(ed.index, ed); });
+        realEditionsPerAsset[assetId] = Array.from(byIndex.values());
+      };
+      const totalCountPerAsset = {};
+
+      if (needFallback.length > 0) {
+        console.log(`Phase C-fallback — ${needFallback.length} assets (${assetsZero.length} zéro · ${assetsPartial.length} partiels). Batched aliased…`);
+        const single = needFallback.filter(a => (a.copies || 1) === 1);
+        const multi = needFallback.filter(a => (a.copies || 1) > 1);
+
+        const runTier = async (assets, batchSize, first) => {
+          const batches = chunk(assets.map(a => a.id), batchSize);
+          await mapPool(batches, SNAP_CONF.FALLBACK_BATCH_CONCURRENCY, async (ids) => {
+            const result = await gqlBatchEditions(ids, { first });
+            ids.forEach(id => {
+              const r = result[id];
+              if (!r) return;
+              totalCountPerAsset[id] = r.totalCount || 0;
+              const eds = r.editions || [];
+              if ((r.totalCount || 0) > 0 && eds.length === 0) { phantomAssetIds.add(id); return; }
+              if (eds.length > 0) {
+                mergeEditions(id, eds.map(ed => ({ id: ed.id, index: ed.index, owner: ed.owner, ownership: ed.ownership || { primary: false } })));
+              }
+            });
+            if (SNAP_CONF.FALLBACK_INTER_BATCH_DELAY_MS > 0) await sleep(SNAP_CONF.FALLBACK_INTER_BATCH_DELAY_MS);
+          });
+        };
+
+        await runTier(single, SNAP_CONF.FALLBACK_BATCH_SIZE_SINGLE, 1);
+        await runTier(multi, SNAP_CONF.FALLBACK_BATCH_SIZE_MULTI, 100);
+
+        // Débordement pour les multi-éditions à >100 éditions
+        for (const a of multi) {
+          const tc = totalCountPerAsset[a.id] || 0;
+          if (tc > 100) {
+            let skip = 100;
+            while (skip < tc && skip < 5000) {
+              const r = await gqlBatchEditions([a.id], { first: 100, skip });
+              const eds = r[a.id]?.editions || [];
+              if (eds.length === 0) break;
+              mergeEditions(a.id, eds.map(ed => ({ id: ed.id, index: ed.index, owner: ed.owner, ownership: ed.ownership || { primary: false } })));
+              skip += 100;
+              await sleep(SNAP_CONF.FALLBACK_INTER_BATCH_DELAY_MS);
+            }
+          }
+        }
+
+        // ── Secondary — editionEvents pour les assets toujours vides (withdrawn) ──
+        const stillMissing = needFallback.filter(a => !realEditionsPerAsset[a.id]?.length && !phantomAssetIds.has(a.id));
+        if (stillMissing.length > 0 && stillMissing.length <= SNAP_CONF.SECONDARY_FALLBACK_CAP) {
+          console.log(`Phase C-fallback (secondary) — ${stillMissing.length} assets via editionEvents…`);
+          for (const a of stillMissing) {
+            const edId = a.latestPurchasedEdition?.id || a.offerableEditionId || a.defaultListingV2?.editionId;
+            if (!edId) continue;
+            try {
+              const d = await gql('EditionEvents', { editionId: edId, cacheId: 'snap-ee-' + edId }, Q_EDITION_EVENTS);
+              const events = d?.public?.editionEvents || [];
+              let owner = null;
+              for (const ev of events) {
+                if (ev.toUser?.username) { owner = ev.toUser; break; }
+                else if (ev.nature === 'withdrawn' && ev.user?.username) { owner = ev.user; break; }
+              }
+              if (owner) realEditionsPerAsset[a.id] = [{ id: edId, index: 1, owner, ownership: { primary: false } }];
+              await sleep(80);
+            } catch (e) { /* on continue */ }
+          }
+        }
+      }
+    }
+
+    // ── Filtre fantômes (totalCount>0 mais editions:[]) ───────────────────────
+    if (phantomAssetIds.size > 0) {
+      const before = allAssets.length;
+      for (let i = allAssets.length - 1; i >= 0; i--) {
+        if (phantomAssetIds.has(allAssets[i].id)) allAssets.splice(i, 1);
+      }
+      console.log(`  ✓ Filtre fantômes : ${phantomAssetIds.size} assets buggés exclus (${before} → ${allAssets.length}).`);
+    }
+
+    // ── PHASE E — Agrégation : 1 count / édition, holder keyé par uuid||username ──
+    const holderMap = {};
+    let totalAttributed = 0;
+    const upsertHolder = (own) => {
+      if (!own?.username) return;
+      const k = own.uuid || own.username;
+      if (!holderMap[k]) {
+        holderMap[k] = { username: own.username, uuid: k, count: 0 };
+      }
+      holderMap[k].count += 1;
+    };
+    allAssets.forEach(a => {
+      const eds = realEditionsPerAsset[a.id] || [];
+      eds.forEach(ed => {
+        if (ed?.owner?.username) { upsertHolder(ed.owner); totalAttributed++; }
+      });
+    });
+
+    // ── Conversion vers ownerNFTs (username→count) + contribution au global ──
+    const ownerNFTs = {};
+    Object.values(holderMap).forEach(h => {
+      ownerNFTs[h.username] = (ownerNFTs[h.username] || 0) + h.count;
+      globalOwnerNFTs[h.username] = (globalOwnerNFTs[h.username] || 0) + h.count;
+    });
+
+    // ── Récupérer les liens Twitter/X pour les nouveaux propriétaires ──
+    const newOwners = Object.keys(ownerNFTs).filter(o => !(o in ownersData));
+    if (newOwners.length > 0) {
+      console.log(`Fetching Twitter usernames for ${newOwners.length} new owner${newOwners.length === 1 ? '' : 's'}…`);
+      await mapPool(newOwners, 4, async (owner) => {
+        const twitterUrl = await getTwitterUsername(owner);
+        ownersData[owner] = { username: owner, twitter: twitterUrl };
+      });
+      saveOwnersJson(ownersData);
+    }
+
+    // ── Logs de discrepancy ──
+    const scrapedOwnersCount = Object.keys(ownerNFTs).length;
+    if (officialItems > 0 && totalAttributed !== officialItems) {
+      console.warn(`Discrepancy detected for collection ${collectionName}: Scraped ${totalAttributed} editions, but expected ${officialItems}.`);
+    }
+    if (officialOwners > 0 && scrapedOwnersCount !== officialOwners) {
+      console.warn(`Discrepancy in owner count for collection ${collectionName}: Scraped ${scrapedOwnersCount} owners, but expected ${officialOwners}.`);
+    }
+
+    collectionsData.push({
+      collectionId,
+      collectionName,
+      totalSupply: officialItems > 0 ? officialItems : totalAttributed,
+      owners: officialOwners > 0 ? officialOwners : scrapedOwnersCount,
+      sales: officialSales,      // ventes secondaires (live crypto.com)
+      volume: officialVolume,    // volume échangé USD (live crypto.com)
+      floor: officialFloor,      // floor USD (live crypto.com)
+      ownerNFTs
+    });
+
+    console.log(`✅ ${collectionName}: ${scrapedOwnersCount} unique owners · ${totalAttributed} editions counted.`);
+    return { collectionName, ownerNFTs, ok: true };
+
+  } catch (error) {
+    console.error(`Error scraping collection ${collectionId}:`, error.message);
+    collectionsData.push({
+      collectionId,
+      collectionName: collectionName || 'Error',
+      totalSupply: 0,
+      owners: 0,
+      ownerNFTs: {}
+    });
+    return { collectionName: collectionName || 'Error', ownerNFTs: {}, ok: false };
+  }
+}
+
+// Scrape TOUTES les collections crypto.com en repartant d'un état VIDE (anti double-comptage :
+// globalOwnerNFTs/collectionsData sont remis à zéro avant chaque passage). Renvoie la liste des URLs en échec.
+async function scrapeAllCollections(globalOwnerNFTs, collectionsData, ownersData) {
+  for (const k in globalOwnerNFTs) delete globalOwnerNFTs[k];
+  collectionsData.length = 0;
+  const failed = [];
+  for (const { url, usePagination } of collectionUrls) {
+    console.log(`\n=== Processing collection: ${url} ===`);
+    const r = await processCollection(url, usePagination, globalOwnerNFTs, collectionsData, ownersData);
+    if (!r.ok) failed.push(url);
+    await delay(3000); // courte pause entre collections (le batching réduit déjà fortement le débit)
+  }
+  return failed;
+}
+
+async function main() {
+  try {
+    const ownersData = loadOwnersJson();
+    const globalOwnerNFTs = {};
+    const collectionsData = [];
+
+    // 1er passage. Les 429 de crypto.com arrivent en RAFALES : si une collection échoue,
+    // une pause de 90s laisse le rate-limit retomber, puis on refait un passage COMPLET
+    // (état réinitialisé → aucun double-comptage). Évite les runs « rouges » sur un 429 ponctuel.
+    let failedCollections = await scrapeAllCollections(globalOwnerNFTs, collectionsData, ownersData);
+    if (failedCollections.length > 0) {
+      console.warn(`\n⏳ ${failedCollections.length}/${collectionUrls.length} collection(s) en échec (429 ?). Pause 90s puis nouveau passage complet…`);
+      await delay(90000);
+      failedCollections = await scrapeAllCollections(globalOwnerNFTs, collectionsData, ownersData);
+    }
+
+    // ── GARDE-FOU n°1 : échec PERSISTANT (même après reprise) ──
+    if (failedCollections.length > 0) {
+      console.error(`\n❌ ${failedCollections.length}/${collectionUrls.length} collection(s) toujours en échec après reprise (API bloquée / 429 ?). data.json NON modifié pour ne pas publier des données partielles :`);
+      failedCollections.forEach(u => console.error(`   - ${u}`));
+      process.exitCode = 1;
+      return;
+    }
+
+    const totalUniqueOwners = Object.keys(globalOwnerNFTs).length;
+    const totalCryptonautsAcrossAllCollections = collectionsData.reduce((sum, data) => sum + data.totalSupply, 0);
+
+    console.log('\n=== Global Summary ===');
+    console.log(`Total Unique Owners: ${totalUniqueOwners}`);
+    console.log(`Total Cryptonauts Across All Collections: ${totalCryptonautsAcrossAllCollections}\n`);
+
+    // ── GARDE-FOU n°2 : aucune donnée du tout ──
+    if (totalUniqueOwners === 0) {
+      console.error('\n❌ Aucun propriétaire récupéré (API bloquée / 403 ?). data.json NON modifié pour ne pas écraser le classement.');
+      process.exitCode = 1;
+      return;
+    }
+
+    saveOwnersJson(ownersData);
+
+    // PUPPETZ n'a pas de collection externe on-chain (pas d'équivalent Crovia/Cronos V3) :
+    // toutes les collections proviennent directement de crypto.com.
+    const v3Collection = null;
+    const v3Mints = [];
+
+    writeCryptonautsData(collectionsData, globalOwnerNFTs, ownersData, v3Collection, v3Mints);
+
+  } catch (error) {
+    console.error('Main execution failed:', error.message);
+    process.exitCode = 1;
+  }
+}
+
+// Exécuter le script
+main().catch(error => {
+  console.error('Main execution failed:', error.message);
+  process.exitCode = 1;
+});
