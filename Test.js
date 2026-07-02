@@ -104,21 +104,28 @@ const HTTP_HEADERS = {
 
 // Tunables — calqués sur SNAP_CONF (v3.9.8). Le modèle de coût de l'API plafonne
 // à 250/requête, ~17 par alias → 10 alias × first=1 ≈ 170 (sûr), 5 × first=100 ≈ 135.
+// Mode DOUX optionnel (utile depuis une IP datacenter que crypto.com limite en 429/1015) :
+//   GENTLE=1  → concurrence 1 + délais rallongés (plus lent mais moins de rate-limit).
+// Le runner résidentiel n'a pas besoin de GENTLE → comportement par défaut inchangé.
+const GENTLE = /^(1|true|yes)$/i.test(process.env.GENTLE || '');
 const SNAP_CONF = {
   ASSET_PAGE_SIZE:                 100,  // assets() page size (max API)
-  ASSET_PAGE_CONCURRENCY:            3,  // pages assets() en parallèle
+  ASSET_PAGE_CONCURRENCY: GENTLE ? 1 : 3,  // pages assets() en parallèle
   HISTORY_PAGE_SIZE:               100,  // eventHistory page size (séquentiel)
   HISTORY_MAX_CONSECUTIVE_FAILS:     5,  // abandon après N échecs d'affilée
-  RETRY_BASE_MS:                   500,  // backoff exponentiel de base
-  RETRY_MAX_ATTEMPTS:                7,  // 0.5,1,2,4,8,16,30s (anti-429 résilient)
+  RETRY_BASE_MS:        GENTLE ? 1500 : 500,  // backoff exponentiel de base
+  RETRY_MAX_ATTEMPTS:   GENTLE ? 9 : 7,  // 0.5,1,2,4,8,16,30s (anti-429 résilient)
   RETRY_MAX_MS:                  30000,  // plafond du backoff
   PHASE_B_EMPTY_WAVE_LIMIT:          3,  // stop pagination spéculative après N vagues vides
   FALLBACK_BATCH_SIZE_SINGLE:       10,  // alias/HTTP pour single-edition (first=1)
   FALLBACK_BATCH_SIZE_MULTI:         5,  // alias/HTTP pour multi-edition  (first=100)
-  FALLBACK_BATCH_CONCURRENCY:        2,  // batches de fallback en parallèle
-  FALLBACK_INTER_BATCH_DELAY_MS:    50,  // petit délai entre batches
+  FALLBACK_BATCH_CONCURRENCY: GENTLE ? 1 : 2,  // batches de fallback en parallèle
+  FALLBACK_INTER_BATCH_DELAY_MS: GENTLE ? 400 : 50,  // petit délai entre batches
   SECONDARY_FALLBACK_CAP:           50,  // max assets retentés via editionEvents
 };
+// SKIP_TWITTER=1 → n'interroge pas les handles X/Twitter (gros multiplicateur de requêtes).
+// Les liens X seront backfillés lors d'un run ultérieur (le cache Owners.json persiste).
+const SKIP_TWITTER = /^(1|true|yes)$/i.test(process.env.SKIP_TWITTER || '');
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -903,7 +910,9 @@ async function processCollection(collectionUrl, usePagination, globalOwnerNFTs, 
     });
 
     // ── Récupérer les liens Twitter/X pour les nouveaux propriétaires ──
-    const newOwners = Object.keys(ownerNFTs).filter(o => !(o in ownersData));
+    // SKIP_TWITTER : on ne touche pas à ownersData → un run ultérieur (sans le flag)
+    // récupérera les handles manquants (backfill).
+    const newOwners = SKIP_TWITTER ? [] : Object.keys(ownerNFTs).filter(o => !(o in ownersData));
     if (newOwners.length > 0) {
       console.log(`Fetching Twitter usernames for ${newOwners.length} new owner${newOwners.length === 1 ? '' : 's'}…`);
       await mapPool(newOwners, 4, async (owner) => {
@@ -959,7 +968,7 @@ async function scrapeAllCollections(globalOwnerNFTs, collectionsData, ownersData
     console.log(`\n=== Processing collection: ${url} ===`);
     const r = await processCollection(url, usePagination, globalOwnerNFTs, collectionsData, ownersData);
     if (!r.ok) failed.push(url);
-    await delay(3000); // courte pause entre collections (le batching réduit déjà fortement le débit)
+    await delay(GENTLE ? 12000 : 3000); // pause entre collections (rallongée en mode doux)
   }
   return failed;
 }
