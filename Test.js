@@ -915,7 +915,7 @@ async function processCollection(collectionUrl, usePagination, globalOwnerNFTs, 
     const newOwners = SKIP_TWITTER ? [] : Object.keys(ownerNFTs).filter(o => !(o in ownersData));
     if (newOwners.length > 0) {
       console.log(`Fetching Twitter usernames for ${newOwners.length} new owner${newOwners.length === 1 ? '' : 's'}…`);
-      await mapPool(newOwners, 4, async (owner) => {
+      await mapPool(newOwners, GENTLE ? 1 : 4, async (owner) => {
         const twitterUrl = await getTwitterUsername(owner);
         ownersData[owner] = { username: owner, twitter: twitterUrl };
       });
